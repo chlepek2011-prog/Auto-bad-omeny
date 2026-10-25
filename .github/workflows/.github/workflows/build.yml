@@ -1,0 +1,492 @@
+name: Build AutoBadOmen
+
+# Ten jeden plik zawiera cały mod (kod w sekcji "Generate project").
+# Po wrzuceniu do repo Actions sam zbuduje .jar i wystawi go w "Releases".
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Generate project
+        run: |
+          mkdir -p work
+          cat > work/settings.gradle <<'__END_OF_FILE__'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          __END_OF_FILE__
+          cat > work/gradle.properties <<'__END_OF_FILE__'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.9
+
+          mod_version=1.0.0
+          maven_group=autobadomen
+          archives_base_name=autobadomen
+
+          fabric_version=0.102.0+1.21.1
+          __END_OF_FILE__
+          cat > work/build.gradle <<'__END_OF_FILE__'
+          plugins {
+              id 'fabric-loom' version '1.7-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+              it.options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          __END_OF_FILE__
+          mkdir -p work/src/main/resources
+          cat > work/src/main/resources/fabric.mod.json <<'__END_OF_FILE__'
+          {
+            "schemaVersion": 1,
+            "id": "autobadomen",
+            "version": "${version}",
+            "name": "Auto Bad Omen",
+            "description": "Co N minut sam pije Ominous Bottle (Bad Omen) i wraca na ten sam slot hotbara.",
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["autobadomen.AutoBadOmenClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.15.0",
+              "minecraft": ">=1.21 <=1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          __END_OF_FILE__
+          mkdir -p work/src/main/java/autobadomen
+          cat > work/src/main/java/autobadomen/AutoBadOmenClient.java <<'__END_OF_FILE__'
+          package autobadomen;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+
+          public class AutoBadOmenClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  Config.load();
+                  Drinker.init();
+                  ClientTickEvents.END_CLIENT_TICK.register(Drinker::tick);
+                  ClientCommandRegistrationCallback.EVENT.register(
+                          (dispatcher, registryAccess) -> BadOmenCommand.register(dispatcher));
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p work/src/main/java/autobadomen
+          cat > work/src/main/java/autobadomen/Config.java <<'__END_OF_FILE__'
+          package autobadomen;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+
+          /**
+           * Ustawienia moda. Plik: config/autobadomen.json (w folderze gry).
+           * Zmiany w pliku wczytasz komendą /badomen reload (albo restartem gry).
+           */
+          public final class Config {
+              public static final Logger LOG = LoggerFactory.getLogger("autobadomen");
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              // ====== USTAWIENIA ======
+              /** Czy mod w ogóle działa. */
+              public boolean enabled = true;
+              /** Co ile minut pić butelkę. */
+              public int intervalMinutes = 70;
+              /** Czy pierwsza butelka ma być wypita zaraz po odpaleniu gry (po joinDelaySeconds). */
+              public boolean drinkOnJoin = true;
+              /** Opóźnienie pierwszego picia po starcie gry. */
+              public int joinDelaySeconds = 10;
+              /** Czy ciągnąć butelkę z ekwipunku, gdy nie ma jej w hotbarze. */
+              public boolean useInventory = true;
+              /** Po ilu minutach spróbować ponownie, gdy brakuje butelki. */
+              public int retryMinutes = 5;
+              /** Ile ticków (20 = 1 s) czekać po wypiciu, zanim wrócimy na stary slot. Zwiększ przy dużym pingu. */
+              public int restoreDelayTicks = 15;
+              /** Komunikaty na czacie. */
+              public boolean showMessages = true;
+
+              // ====== KOD ======
+              private static Config instance = new Config();
+
+              public static Config get() {
+                  return instance;
+              }
+
+              private static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("autobadomen.json");
+              }
+
+              public static void load() {
+                  Path p = path();
+                  if (Files.exists(p)) {
+                      try (Reader r = Files.newBufferedReader(p, StandardCharsets.UTF_8)) {
+                          Config loaded = GSON.fromJson(r, Config.class);
+                          if (loaded != null) {
+                              instance = loaded;
+                          }
+                      } catch (Exception e) {
+                          LOG.error("Nie mogę wczytać configu, używam domyślnych ustawień", e);
+                          instance = new Config();
+                      }
+                  }
+                  instance.sanitize();
+                  save();
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(path(), GSON.toJson(instance), StandardCharsets.UTF_8);
+                  } catch (IOException e) {
+                      LOG.error("Nie mogę zapisać configu", e);
+                  }
+              }
+
+              private void sanitize() {
+                  if (intervalMinutes < 1) intervalMinutes = 1;
+                  if (joinDelaySeconds < 1) joinDelaySeconds = 1;
+                  if (retryMinutes < 1) retryMinutes = 1;
+                  if (restoreDelayTicks < 1) restoreDelayTicks = 1;
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p work/src/main/java/autobadomen
+          cat > work/src/main/java/autobadomen/Drinker.java <<'__END_OF_FILE__'
+          package autobadomen;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+
+          /**
+           * Logika: co N minut znajdź Ominous Bottle -> przełącz na nią -> wypij -> wróć na stary slot.
+           */
+          public final class Drinker {
+              private enum State { IDLE, DRINKING, WAIT_RESTORE }
+
+              private static State state = State.IDLE;
+              private static long nextAt;
+              private static boolean forced;
+              private static int ticksInWorld;
+
+              private static int originalSlot;
+              private static int swappedFrom = -1;
+              private static int drinkTicks;
+              private static boolean sawUsing;
+              private static int waitTicks;
+
+              private Drinker() {
+              }
+
+              public static void init() {
+                  Config c = Config.get();
+                  long delayMs = c.drinkOnJoin ? c.joinDelaySeconds * 1000L : c.intervalMinutes * 60_000L;
+                  nextAt = System.currentTimeMillis() + delayMs;
+              }
+
+              /** Liczy interwał od nowa, od teraz. */
+              public static void reschedule() {
+                  nextAt = System.currentTimeMillis() + Config.get().intervalMinutes * 60_000L;
+              }
+
+              /** Wypij od razu (komenda /badomen now). */
+              public static void drinkNow() {
+                  forced = true;
+              }
+
+              public static long millisToNext() {
+                  return Math.max(0L, nextAt - System.currentTimeMillis());
+              }
+
+              public static void tick(MinecraftClient client) {
+                  ClientPlayerEntity player = client.player;
+                  if (player == null || client.world == null || client.interactionManager == null) {
+                      if (state != State.IDLE) {
+                          client.options.useKey.setPressed(false);
+                          state = State.IDLE;
+                          swappedFrom = -1;
+                      }
+                      ticksInWorld = 0;
+                      return;
+                  }
+                  ticksInWorld++;
+
+                  switch (state) {
+                      case IDLE -> idle(client, player);
+                      case DRINKING -> drinking(client, player);
+                      case WAIT_RESTORE -> {
+                          waitTicks--;
+                          if (waitTicks <= 0) {
+                              restore(client, player);
+                          }
+                      }
+                  }
+              }
+
+              private static void idle(MinecraftClient client, ClientPlayerEntity player) {
+                  Config c = Config.get();
+                  if (ticksInWorld < (forced ? 5 : 100)) return;
+                  if (!forced && (!c.enabled || System.currentTimeMillis() < nextAt)) return;
+                  // czekamy na wolną chwilę: bez otwartego ekranu, bez jedzenia/picia czegoś innego
+                  if (client.currentScreen != null || player.isUsingItem() || !player.isAlive()) return;
+                  forced = false;
+                  start(client, player, c);
+              }
+
+              private static void start(MinecraftClient client, ClientPlayerEntity player, Config c) {
+                  PlayerInventory inv = player.getInventory();
+                  originalSlot = inv.selectedSlot;
+                  swappedFrom = -1;
+
+                  int slot = findBottle(inv, 0, 9);
+                  if (slot == -1 && c.useInventory) {
+                      int from = findBottle(inv, 9, 36);
+                      if (from != -1) {
+                          // podmień butelkę z ekwipunku na aktualnie wybrany slot hotbara
+                          client.interactionManager.clickSlot(
+                                  player.playerScreenHandler.syncId, from, originalSlot, SlotActionType.SWAP, player);
+                          swappedFrom = from;
+                          slot = originalSlot;
+                      }
+                  }
+
+                  if (slot == -1) {
+                      nextAt = System.currentTimeMillis() + c.retryMinutes * 60_000L;
+                      say(player, c, "Brak Ominous Bottle. Spróbuję za " + c.retryMinutes + " min.");
+                      return;
+                  }
+
+                  inv.selectedSlot = slot;
+                  client.interactionManager.interactItem(player, Hand.MAIN_HAND);
+                  client.options.useKey.setPressed(true);
+                  drinkTicks = 0;
+                  sawUsing = false;
+                  state = State.DRINKING;
+              }
+
+              private static void drinking(MinecraftClient client, ClientPlayerEntity player) {
+                  drinkTicks++;
+                  if (player.isUsingItem()) {
+                      sawUsing = true;
+                  }
+                  Config c = Config.get();
+
+                  // przerwane (ekran, śmierć) albo coś poszło nie tak (timeout ~5 s)
+                  if (client.currentScreen != null || !player.isAlive() || drinkTicks > 100) {
+                      client.options.useKey.setPressed(false);
+                      if (player.isUsingItem()) {
+                          client.interactionManager.stopUsingItem(player);
+                      }
+                      nextAt = System.currentTimeMillis() + 60_000L;
+                      restore(client, player);
+                      say(player, c, "Picie przerwane. Spróbuję za minutę.");
+                      return;
+                  }
+
+                  // gotowe: było picie i się skończyło
+                  if (sawUsing && !player.isUsingItem()) {
+                      client.options.useKey.setPressed(false);
+                      nextAt = System.currentTimeMillis() + c.intervalMinutes * 60_000L;
+                      waitTicks = Math.max(1, c.restoreDelayTicks);
+                      state = State.WAIT_RESTORE;
+                      say(player, c, "Wypito Ominous Bottle. Następne za " + c.intervalMinutes + " min.");
+                      return;
+                  }
+
+                  // trzymamy "użyj", żeby gra nie przerwała picia
+                  client.options.useKey.setPressed(true);
+              }
+
+              private static void restore(MinecraftClient client, ClientPlayerEntity player) {
+                  if (swappedFrom != -1 && player.isAlive()
+                          && player.currentScreenHandler == player.playerScreenHandler) {
+                      // odwrotna podmiana: reszta butelek wraca do ekwipunku, stary przedmiot na swój slot
+                      client.interactionManager.clickSlot(
+                              player.playerScreenHandler.syncId, swappedFrom, originalSlot, SlotActionType.SWAP, player);
+                  }
+                  swappedFrom = -1;
+                  player.getInventory().selectedSlot = originalSlot;
+                  state = State.IDLE;
+              }
+
+              private static int findBottle(PlayerInventory inv, int from, int to) {
+                  for (int i = from; i < to; i++) {
+                      if (inv.getStack(i).isOf(Items.OMINOUS_BOTTLE)) {
+                          return i;
+                      }
+                  }
+                  return -1;
+              }
+
+              private static void say(ClientPlayerEntity player, Config c, String msg) {
+                  if (c.showMessages) {
+                      player.sendMessage(Text.literal("[AutoBadOmen] " + msg), false);
+                  }
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p work/src/main/java/autobadomen
+          cat > work/src/main/java/autobadomen/BadOmenCommand.java <<'__END_OF_FILE__'
+          package autobadomen;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.BoolArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+          import net.minecraft.text.Text;
+
+          /** Komendy klienckie: /badomen ... (nie wysyłają się na serwer). */
+          public final class BadOmenCommand {
+              private BadOmenCommand() {
+              }
+
+              public static void register(CommandDispatcher<FabricClientCommandSource> dispatcher) {
+                  dispatcher.register(ClientCommandManager.literal("badomen")
+                          .executes(ctx -> status(ctx.getSource()))
+                          .then(ClientCommandManager.literal("status")
+                                  .executes(ctx -> status(ctx.getSource())))
+                          .then(ClientCommandManager.literal("on")
+                                  .executes(ctx -> {
+                                      Config.get().enabled = true;
+                                      Config.save();
+                                      Drinker.reschedule();
+                                      return status(ctx.getSource());
+                                  }))
+                          .then(ClientCommandManager.literal("off")
+                                  .executes(ctx -> {
+                                      Config.get().enabled = false;
+                                     Config.save();
+                                      return status(ctx.getSource());
+                                  }))
+                          .then(ClientCommandManager.literal("now")
+                                  .executes(ctx -> {
+                                      Drinker.drinkNow();
+                                      return reply(ctx.getSource(), "Piję teraz.");
+                                  }))
+                          .then(ClientCommandManager.literal("interval")
+                                  .then(ClientCommandManager.argument("minuty", IntegerArgumentType.integer(1, 100000))
+                                          .executes(ctx -> {
+                                              int m = IntegerArgumentType.getInteger(ctx, "minuty");
+                                              Config.get().intervalMinutes = m;
+                                              Config.save();
+                                              Drinker.reschedule();
+                                              return status(ctx.getSource());
+                                          })))
+                          .then(ClientCommandManager.literal("inventory")
+                                  .then(ClientCommandManager.argument("wartosc", BoolArgumentType.bool())
+                                          .executes(ctx -> {
+                                              Config.get().useInventory = BoolArgumentType.getBool(ctx, "wartosc");
+                                              Config.save();
+                                              return status(ctx.getSource());
+                                          })))
+                          .then(ClientCommandManager.literal("reload")
+                                  .executes(ctx -> {
+                                      Config.load();
+                                      Drinker.reschedule();
+                                      return status(ctx.getSource());
+                                  })));
+              }
+
+              private static int status(FabricClientCommandSource src) {
+                  Config c = Config.get();
+                  long sec = Drinker.millisToNext() / 1000L;
+                  String next = c.enabled ? (sec / 60) + " min " + (sec % 60) + " s" : "-";
+                  return reply(src, "Auto Bad Omen: " + (c.enabled ? "WŁĄCZONY" : "wyłączony")
+                          + " | co " + c.intervalMinutes + " min | następne za " + next
+                          + " | butelki z ekwipunku: " + (c.useInventory ? "tak" : "nie")
+                          + "\nKomendy: /badomen on | off | now | status | interval <min> | inventory <true/false> | reload");
+              }
+
+              private static int reply(FabricClientCommandSource src, String msg) {
+                  src.sendFeedback(Text.literal(msg));
+                  return 1;
+              }
+          }
+          __END_OF_FILE__
+
+      - name: Build
+        working-directory: work
+        run: gradle build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autobadomen
+          path: work/build/libs/autobadomen-*.jar
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: AutoBadOmen build ${{ github.run_number }}
+          files: work/build/libs/autobadomen-*.jar
